@@ -44,7 +44,7 @@ jobs:
             pip install pytest httpx
       - run:
           name: Run unit tests
-          command: pytest -v tests/unit
+          command: pytest -v tests/units.py
 
   integration_tests:
     docker:
