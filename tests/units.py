@@ -1,4 +1,3 @@
-import pytest
 
 
 def test_short_code_length():
