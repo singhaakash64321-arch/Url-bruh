@@ -1,0 +1,197 @@
+version: 2.1
+
+jobs:
+  secret_scan:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Install Gitleaks
+          command: |
+            GITLEAKS_VERSION="8.24.2"
+            curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+            tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+      - run:
+          name: Scan repository for secrets
+          command: /tmp/gitleaks detect --source . --redact --verbose
+
+  lint:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: |
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+            pip install ruff pytest httpx
+      - run:
+          name: Ruff lint
+          command: ruff check app tests
+
+  unit_tests:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: |
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+            pip install pytest httpx
+      - run:
+          name: Run unit tests
+          command: pytest -v tests/unit
+
+  integration_tests:
+    docker:
+      - image: cimg/python:3.12
+      - image: postgres:16
+        environment:
+          POSTGRES_DB: urldb
+          POSTGRES_USER: urluser
+          POSTGRES_PASSWORD: urlpassword
+      - image: redis:7
+    environment:
+      DATABASE_URL: postgresql://urluser:urlpassword@localhost:5432/urldb
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - checkout
+      - run:
+          name: Install PostgreSQL client
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+      - run:
+          name: Wait for database services
+          command: |
+            for i in $(seq 1 30); do
+              pg_isready -h localhost -p 5432 -U urluser -d urldb && break
+              sleep 2
+            done
+            pg_isready -h localhost -p 5432 -U urluser -d urldb
+            for i in $(seq 1 30); do
+              if bash -c 'echo > /dev/tcp/localhost/6379' 2>/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+            bash -c 'echo > /dev/tcp/localhost/6379'
+      - run:
+          name: Install Python dependencies
+          command: |
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+            pip install pytest httpx
+      - run:
+          name: Apply database migrations
+          command: |
+            for file in migrations/*.sql; do
+              [ -f "$file" ] || continue
+              PGPASSWORD=urlpassword psql \
+                -v ON_ERROR_STOP=1 \
+                -h localhost -U urluser -d urldb -f "$file"
+            done
+      - run:
+          name: Run integration tests
+          command: pytest -v tests/integration
+
+  build_and_push_qa:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build and push QA image
+          command: |
+            set -e
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+            IMAGE="$DOCKERHUB_USER/url-shortener"
+            SHA=$(git rev-parse --short HEAD)
+            docker build -t "$IMAGE:qa" -t "$IMAGE:qa-$SHA" .
+            docker push "$IMAGE:qa"
+            docker push "$IMAGE:qa-$SHA"
+
+  build_and_push_stage:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build and push staging image
+          command: |
+            set -e
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+            IMAGE="$DOCKERHUB_USER/url-shortener"
+            SHA=$(git rev-parse --short HEAD)
+            docker build -t "$IMAGE:stage" -t "$IMAGE:stage-$SHA" .
+            docker push "$IMAGE:stage"
+            docker push "$IMAGE:stage-$SHA"
+
+  build_and_push_prod:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build and push production image
+          command: |
+            set -e
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+            IMAGE="$DOCKERHUB_USER/url-shortener"
+            SHA=$(git rev-parse --short HEAD)
+            docker build -t "$IMAGE:prod" -t "$IMAGE:prod-$SHA" .
+            docker push "$IMAGE:prod"
+            docker push "$IMAGE:prod-$SHA"
+
+workflows:
+  version: 2
+
+  qa_pipeline:
+    jobs:
+      - secret_scan:
+          filters:
+            branches:
+              only: main
+      - lint:
+          filters:
+            branches:
+              only: main
+      - unit_tests:
+          filters:
+            branches:
+              only: main
+      - integration_tests:
+          requires:
+            - secret_scan
+            - lint
+            - unit_tests
+          filters:
+            branches:
+              only: main
+      - build_and_push_qa:
+          requires:
+            - integration_tests
+          filters:
+            branches:
+              only: main
+
+  staging_pipeline:
+    jobs:
+      - build_and_push_stage:
+          filters:
+            branches:
+              only: staging
+
+  production_pipeline:
+    jobs:
+      - build_and_push_prod:
+          filters:
+            branches:
+              only: production
