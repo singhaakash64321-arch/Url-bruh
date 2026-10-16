@@ -97,7 +97,7 @@ jobs:
             done
       - run:
           name: Run integration tests
-          command: pytest -v tests/integration
+          command: pytest -v tests/integration.py
 
   build_and_push_qa:
     docker:
